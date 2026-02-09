@@ -158,6 +158,7 @@ public class FishingPlugin extends Plugin
 		{
 			fishingSpots.clear();
 			minnowSpots.clear();
+			currentSpot = null;
 		}
 	}
 
@@ -179,7 +180,7 @@ public class FishingPlugin extends Plugin
 			|| canPlayerFish(client.getItemContainer(InventoryID.INV))
 			|| canPlayerFish(client.getItemContainer(InventoryID.WORN));
 
-		if (!showOverlays)
+		if (!showOverlays && getInteractingSpot() == null)
 		{
 			currentSpot = null;
 		}
@@ -286,6 +287,12 @@ public class FishingPlugin extends Plugin
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
+		final FishingSpot interactingSpot = getInteractingSpot();
+		if (interactingSpot != null)
+		{
+			currentSpot = interactingSpot;
+		}
+
 		// Reset fishing session
 		if (session.getLastFishCaught() != null)
 		{
@@ -294,7 +301,11 @@ public class FishingPlugin extends Plugin
 
 			if (sinceCaught.compareTo(statTimeout) >= 0)
 			{
-				currentSpot = null;
+				if (interactingSpot == null)
+				{
+					currentSpot = null;
+				}
+
 				session.setLastFishCaught(null);
 			}
 		}
@@ -320,6 +331,23 @@ public class FishingPlugin extends Plugin
 
 		updateTrawlerTimer();
 		updateTrawlerContribution();
+	}
+
+	private FishingSpot getInteractingSpot()
+	{
+		final var localPlayer = client.getLocalPlayer();
+		if (localPlayer == null)
+		{
+			return null;
+		}
+
+		final Actor interacting = localPlayer.getInteracting();
+		if (!(interacting instanceof NPC))
+		{
+			return null;
+		}
+
+		return FishingSpot.findSpot(((NPC) interacting).getId());
 	}
 
 	@Subscribe

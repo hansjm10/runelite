@@ -27,18 +27,35 @@ package net.runelite.client.plugins.fishing;
 import com.google.inject.Guice;
 import com.google.inject.testing.fieldbinder.Bind;
 import com.google.inject.testing.fieldbinder.BoundFieldModule;
+import java.time.Duration;
+import java.time.Instant;
 import javax.inject.Inject;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.InteractingChanged;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.NpcID;
 import net.runelite.client.Notifier;
+import net.runelite.client.game.FishingSpot;
 import net.runelite.client.ui.overlay.OverlayManager;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
 public class FishingPluginTest
@@ -74,10 +91,25 @@ public class FishingPluginTest
 	@Bind
 	private FishingSpotMinimapOverlay fishingSpotMinimapOverlay;
 
+	@Mock
+	private Player player;
+
+	@Mock
+	private ItemContainer inventory;
+
+	@Mock
+	private ItemContainer worn;
+
 	@Before
 	public void before()
 	{
 		Guice.createInjector(BoundFieldModule.of(this)).injectMembers(this);
+		when(client.getLocalPlayer()).thenReturn(player);
+		when(player.getWorldLocation()).thenReturn(new WorldPoint(0, 0, 0));
+		when(client.getItemContainer(InventoryID.INV)).thenReturn(inventory);
+		when(client.getItemContainer(InventoryID.WORN)).thenReturn(worn);
+		when(inventory.getItems()).thenReturn(new Item[0]);
+		when(worn.getItems()).thenReturn(new Item[0]);
 	}
 
 	@Test
@@ -126,5 +158,71 @@ public class FishingPluginTest
 		fishingPlugin.onChatMessage(chatMessage);
 
 		assertNotNull(fishingPlugin.getSession().getLastFishCaught());
+	}
+
+	@Test
+	public void testCurrentSpotNotClearedByItemContainerUpdateWhenActivelyFishing()
+	{
+		NPC npc = createFishingSpotNpc();
+		setCurrentSpot(npc);
+		when(player.getInteracting()).thenReturn(npc);
+
+		fishingPlugin.onItemContainerChanged(new ItemContainerChanged(InventoryID.INV, inventory));
+
+		assertEquals(FishingSpot.LOBSTER, fishingPlugin.getCurrentSpot());
+	}
+
+	@Test
+	public void testCurrentSpotClearedByItemContainerUpdateWhenNotActivelyFishing()
+	{
+		setCurrentSpot(createFishingSpotNpc());
+		when(player.getInteracting()).thenReturn(null);
+
+		fishingPlugin.onItemContainerChanged(new ItemContainerChanged(InventoryID.INV, inventory));
+
+		assertNull(fishingPlugin.getCurrentSpot());
+	}
+
+	@Test
+	public void testCurrentSpotNotClearedBySessionTimeoutWhenActivelyFishing()
+	{
+		NPC npc = createFishingSpotNpc();
+		setCurrentSpot(npc);
+		when(player.getInteracting()).thenReturn(npc);
+		when(config.statTimeout()).thenReturn(5);
+		fishingPlugin.getSession().setLastFishCaught(Instant.now().minus(Duration.ofMinutes(10)));
+
+		fishingPlugin.onGameTick(new GameTick());
+
+		assertEquals(FishingSpot.LOBSTER, fishingPlugin.getCurrentSpot());
+		assertNull(fishingPlugin.getSession().getLastFishCaught());
+	}
+
+	@Test
+	public void testCurrentSpotClearedBySessionTimeoutWhenNotActivelyFishing()
+	{
+		setCurrentSpot(createFishingSpotNpc());
+		when(player.getInteracting()).thenReturn(null);
+		when(config.statTimeout()).thenReturn(5);
+		fishingPlugin.getSession().setLastFishCaught(Instant.now().minus(Duration.ofMinutes(10)));
+
+		fishingPlugin.onGameTick(new GameTick());
+
+		assertNull(fishingPlugin.getCurrentSpot());
+		assertNull(fishingPlugin.getSession().getLastFishCaught());
+	}
+
+	private NPC createFishingSpotNpc()
+	{
+		NPC npc = mock(NPC.class);
+		when(npc.getId()).thenReturn(NpcID._0_40_53_RAREFISH);
+		return npc;
+	}
+
+	private void setCurrentSpot(NPC npc)
+	{
+		fishingPlugin.onInteractingChanged(new InteractingChanged(player, npc));
+
+		assertEquals(FishingSpot.LOBSTER, fishingPlugin.getCurrentSpot());
 	}
 }
