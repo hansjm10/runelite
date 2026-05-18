@@ -29,6 +29,8 @@ import com.google.common.primitives.Ints;
 import com.google.inject.Provides;
 import java.awt.Canvas;
 import java.awt.Dimension;
+import java.io.File;
+import java.io.IOException;
 import java.awt.GraphicsConfiguration;
 import java.awt.Image;
 import java.awt.geom.AffineTransform;
@@ -37,6 +39,8 @@ import java.awt.image.DataBufferInt;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -45,6 +49,7 @@ import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.BufferProvider;
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.Constants;
 import net.runelite.api.FloatProjection;
@@ -62,8 +67,11 @@ import net.runelite.api.WorldView;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.PostClientTick;
 import net.runelite.api.hooks.DrawCallbacks;
+import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.RenderCallbackManager;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
@@ -73,15 +81,22 @@ import net.runelite.client.plugins.PluginInstantiationException;
 import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.plugins.gpu.config.AntiAliasingMode;
 import net.runelite.client.plugins.gpu.config.UIScalingMode;
+import net.runelite.client.plugins.gpu.profiling.GpuProfiler;
+import net.runelite.client.plugins.gpu.profiling.GpuProfilerCounter;
+import net.runelite.client.plugins.gpu.profiling.GpuProfilerPhase;
+import net.runelite.client.plugins.gpu.profiling.GpuProfilerSnapshot;
 import net.runelite.client.plugins.gpu.template.Template;
 import net.runelite.client.ui.ClientUI;
 import net.runelite.client.ui.DrawManager;
+import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.rlawt.AWTContext;
 import org.lwjgl.opengl.GL;
+import static org.lwjgl.opengl.GL43C.GL_BUFFER;
 import static org.lwjgl.opengl.GL33C.*;
 import static org.lwjgl.opengl.GL43C.GL_DEBUG_SOURCE_API;
 import static org.lwjgl.opengl.GL43C.GL_DEBUG_TYPE_OTHER;
 import static org.lwjgl.opengl.GL43C.GL_DEBUG_TYPE_PERFORMANCE;
+import static org.lwjgl.opengl.GL43C.GL_PROGRAM;
 import static org.lwjgl.opengl.GL43C.glDebugMessageControl;
 import static org.lwjgl.opengl.GL45C.GL_ZERO_TO_ONE;
 import static org.lwjgl.opengl.GL45C.glClipControl;
@@ -128,10 +143,21 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private DrawManager drawManager;
 
 	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private GpuProfilerOverlay gpuProfilerOverlay;
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
+	@Inject
 	private PluginManager pluginManager;
 
 	@Inject
 	private RenderCallbackManager renderCallbackManager;
+
+	private final GpuProfiler gpuProfiler = new GpuProfiler();
 
 	private Canvas canvas;
 	private AWTContext awtContext;
@@ -172,6 +198,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private int lastStretchedCanvasHeight;
 	private AntiAliasingMode lastAntiAliasingMode;
 	private int lastAnisotropicFilteringLevel = -1;
+	private boolean gpuProfilerFrameActive;
+	private boolean opaqueGpuProfilerPhaseActive;
+	private boolean alphaGpuProfilerPhaseActive;
 
 	private GpuFloatBuffer uniformBuffer;
 
@@ -278,6 +307,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		clientUploader = new SceneUploader(renderCallbackManager);
 		mapUploader = new SceneUploader(renderCallbackManager);
 		facePrioritySorter = new FacePrioritySorter(clientUploader);
+		overlayManager.add(gpuProfilerOverlay);
 		clientThread.invoke(() ->
 		{
 			try
@@ -352,6 +382,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				initVao();
 				initProgram();
 				initInterfaceTexture();
+				updateGpuProfiler();
 				if (glCapabilities.OpenGL45)
 				{
 					glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE); // 1 near 0 far
@@ -422,6 +453,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	protected void shutDown()
 	{
+		overlayManager.remove(gpuProfilerOverlay);
 		clientThread.invoke(() ->
 		{
 			client.setGpuFlags(0);
@@ -431,6 +463,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 			if (lwjglInitted)
 			{
+				gpuProfiler.stop();
+
 				if (textureArrayId != -1)
 				{
 					textureManager.freeTextureArray(textureArrayId);
@@ -509,7 +543,13 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					log.debug("Recompiling shaders");
 					shutdownProgram();
 					initProgram();
+					labelGpuProfilerObjects();
 				});
+			}
+			else if (configChanged.getKey().equals("gpuProfiler")
+				|| configChanged.getKey().equals("gpuProfilerDebugMarkers"))
+			{
+				clientThread.invokeLater(this::updateGpuProfiler);
 			}
 		}
 	}
@@ -546,6 +586,180 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 		client.setUnlockedFpsTarget(actualSwapInterval == 0 ? config.fpsTarget() : 0);
 		checkGLErrors();
+	}
+
+	private void updateGpuProfiler()
+	{
+		if (!lwjglInitted || glCapabilities == null)
+		{
+			return;
+		}
+
+		if (config.gpuProfiler())
+		{
+			gpuProfiler.start(glCapabilities, glGetString(GL_RENDERER), glGetString(GL_VERSION), config.gpuProfilerDebugMarkers());
+			labelGpuProfilerObjects();
+		}
+		else
+		{
+			gpuProfiler.stop();
+			gpuProfilerFrameActive = false;
+			opaqueGpuProfilerPhaseActive = false;
+			alphaGpuProfilerPhaseActive = false;
+		}
+	}
+
+	private void labelGpuProfilerObjects()
+	{
+		if (!gpuProfiler.isEnabled())
+		{
+			return;
+		}
+
+		gpuProfiler.labelObject(GL_PROGRAM, glProgram, "scene shader program");
+		gpuProfiler.labelObject(GL_PROGRAM, glUiProgram, "ui shader program");
+		gpuProfiler.labelObject(GL_BUFFER, glUniformBuffer.glBufferId, "uniform buffer");
+		gpuProfiler.labelObject(GL_TEXTURE, interfaceTexture, "interface texture");
+		gpuProfiler.labelObject(GL_BUFFER, interfacePbo, "interface pixel unpack buffer");
+		gpuProfiler.labelObject(GL_VERTEX_ARRAY, vaoUiHandle, "ui vertex array");
+		gpuProfiler.labelObject(GL_BUFFER, vboUiHandle, "ui vertex buffer");
+		if (textureArrayId != -1)
+		{
+			gpuProfiler.labelObject(GL_TEXTURE, textureArrayId, "scene texture array");
+		}
+		labelGpuProfilerFboObjects();
+	}
+
+	private void labelGpuProfilerFboObjects()
+	{
+		if (!gpuProfiler.isEnabled())
+		{
+			return;
+		}
+
+		gpuProfiler.labelObject(GL_FRAMEBUFFER, fboScene, "scene framebuffer");
+		gpuProfiler.labelObject(GL_RENDERBUFFER, rboColorBuffer, "scene color renderbuffer");
+		gpuProfiler.labelObject(GL_RENDERBUFFER, rboDepthBuffer, "scene depth renderbuffer");
+	}
+
+	private static String gpuProfilerZoneLabel(int worldViewId, int x, int z)
+	{
+		return "zone wv " + worldViewId + " x " + x + " z " + z;
+	}
+
+	GpuProfilerSnapshot getGpuProfilerSnapshot()
+	{
+		return gpuProfiler.snapshot();
+	}
+
+	void resetGpuProfilerSamples()
+	{
+		gpuProfiler.reset();
+		sendGpuProfilerMessage("GPU profiler samples reset.");
+	}
+
+	void exportGpuProfilerSamples()
+	{
+		GpuProfilerSnapshot snapshot = gpuProfiler.snapshot();
+		if (snapshot.getSampleCount() == 0)
+		{
+			sendGpuProfilerMessage("GPU profiler has no samples to export.");
+			return;
+		}
+
+		File dir = new File(RuneLite.RUNELITE_DIR, "gpu-profiler");
+		if (!dir.exists() && !dir.mkdirs())
+		{
+			sendGpuProfilerMessage("Unable to create GPU profiler export directory.");
+			return;
+		}
+
+		File file = new File(dir, "gpu-profile-" + System.currentTimeMillis() + ".csv");
+		try
+		{
+			Files.writeString(file.toPath(), gpuProfiler.exportCsv(), StandardCharsets.UTF_8);
+			sendGpuProfilerMessage("GPU profiler export written to " + file.getAbsolutePath());
+		}
+		catch (IOException ex)
+		{
+			log.warn("Unable to export GPU profiler samples", ex);
+			sendGpuProfilerMessage("Unable to export GPU profiler samples: " + ex.getMessage());
+		}
+	}
+
+	private void sendGpuProfilerMessage(String message)
+	{
+		chatMessageManager.queue(QueuedMessage.builder()
+			.type(ChatMessageType.CONSOLE)
+			.runeLiteFormattedMessage(message)
+			.build());
+	}
+
+	private void beginGpuProfilerFrame()
+	{
+		if (!gpuProfiler.isEnabled() || gpuProfilerFrameActive)
+		{
+			return;
+		}
+
+		final int canvasHeight = client.getCanvasHeight();
+		final int canvasWidth = client.getCanvasWidth();
+		final Dimension stretchedDimensions = client.getStretchedDimensions();
+		final int stretchedCanvasWidth = client.isStretchedEnabled() ? stretchedDimensions.width : canvasWidth;
+		final int stretchedCanvasHeight = client.isStretchedEnabled() ? stretchedDimensions.height : canvasHeight;
+		final int renderTargetWidth = lastStretchedCanvasWidth > 0 ? lastStretchedCanvasWidth : stretchedCanvasWidth;
+		final int renderTargetHeight = lastStretchedCanvasHeight > 0 ? lastStretchedCanvasHeight : stretchedCanvasHeight;
+
+		gpuProfiler.beginFrame(
+			canvasWidth,
+			canvasHeight,
+			stretchedCanvasWidth,
+			stretchedCanvasHeight,
+			renderTargetWidth,
+			renderTargetHeight,
+			client.isStretchedEnabled(),
+			getDrawDistance(),
+			client.getExpandedMapLoading(),
+			config.antiAliasingMode().name(),
+			config.anisotropicFilteringLevel(),
+			config.uiScalingMode().name(),
+			config.unlockFps(),
+			config.syncMode().name(),
+			config.fpsTarget(),
+			config.fogDepth(),
+			config.colorBlindIntensity());
+		gpuProfilerFrameActive = true;
+	}
+
+	private void endGpuProfilerFrame()
+	{
+		if (!gpuProfilerFrameActive)
+		{
+			return;
+		}
+
+		endOpaqueGpuProfilerPhase();
+		endAlphaGpuProfilerPhase();
+		gpuProfiler.endFrame();
+		gpuProfilerFrameActive = false;
+	}
+
+	private void endOpaqueGpuProfilerPhase()
+	{
+		if (opaqueGpuProfilerPhaseActive)
+		{
+			gpuProfiler.endGpuPhase(GpuProfilerPhase.OPAQUE_ZONES);
+			opaqueGpuProfilerPhaseActive = false;
+		}
+	}
+
+	private void endAlphaGpuProfilerPhase()
+	{
+		if (alphaGpuProfilerPhaseActive)
+		{
+			gpuProfiler.endGpuPhase(GpuProfilerPhase.ALPHA_ZONES);
+			alphaGpuProfilerPhaseActive = false;
+		}
 	}
 
 	private Template createTemplate()
@@ -666,9 +880,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		initGlBuffer(glUniformBuffer);
 		Zone.initBuffer();
 
-		vaoO = new VAOList();
-		vaoA = new VAOList();
-		vaoPO = new VAOList();
+		vaoO = new VAOList("dynamic opaque", gpuProfiler);
+		vaoA = new VAOList("dynamic alpha", gpuProfiler);
+		vaoPO = new VAOList("dynamic priority opaque", gpuProfiler);
 	}
 
 	private void initGlBuffer(GLBuffer glBuffer)
@@ -769,6 +983,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		// Reset
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
 		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+		labelGpuProfilerFboObjects();
 	}
 
 	private void shutdownFbo()
@@ -837,6 +1052,13 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private void preSceneDrawToplevel(Scene scene,
 		float cameraX, float cameraY, float cameraZ, float cameraPitch, float cameraYaw)
 	{
+		beginGpuProfilerFrame();
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginPhase(GpuProfilerPhase.SCENE_SETUP);
+		}
+		try
+		{
 		scene.setDrawDistance(getDrawDistance());
 
 		// UBO
@@ -993,6 +1215,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		glEnable(GL_DEPTH_TEST);
 
 		checkGLErrors();
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endPhase(GpuProfilerPhase.SCENE_SETUP);
+			}
+		}
 	}
 
 	@Override
@@ -1010,6 +1240,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private void postDrawToplevel()
 	{
+		endOpaqueGpuProfilerPhase();
+		endAlphaGpuProfilerPhase();
 		glDisable(GL_BLEND);
 		glDisable(GL_CULL_FACE);
 		glDisable(GL_DEPTH_TEST);
@@ -1020,6 +1252,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private void blitSceneFbo()
 	{
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginPhase(GpuProfilerPhase.SCENE_FBO_BLIT);
+		}
+		try
+		{
 		int width = lastStretchedCanvasWidth;
 		int height = lastStretchedCanvasHeight;
 
@@ -1039,6 +1277,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, defaultFbo);
 
 		checkGLErrors();
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endPhase(GpuProfilerPhase.SCENE_FBO_BLIT);
+			}
+		}
 	}
 
 	@Override
@@ -1058,10 +1304,31 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		if (gpuProfiler.isEnabled())
+		{
+			if (!opaqueGpuProfilerPhaseActive)
+			{
+				gpuProfiler.beginGpuPhase(GpuProfilerPhase.OPAQUE_ZONES);
+				opaqueGpuProfilerPhaseActive = true;
+			}
+			gpuProfiler.beginCpuPhase(GpuProfilerPhase.OPAQUE_ZONES);
+			gpuProfiler.incrementCounter(GpuProfilerCounter.OPAQUE_ZONE_DRAWS);
+			gpuProfiler.incrementCounter(GpuProfilerCounter.MULTI_DRAW_CALLS);
+		}
+		try
+		{
 		int offset = scene.getWorldViewId() == WorldView.TOPLEVEL ? (SCENE_OFFSET >> 3) : 0;
 		z.renderOpaque(zx - offset, zz - offset, ctx.minLevel, ctx.level, ctx.maxLevel, ctx.hideRoofIds);
 
 		checkGLErrors();
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endCpuPhase(GpuProfilerPhase.OPAQUE_ZONES);
+			}
+		}
 	}
 
 	private static final int ALPHA_ZSORT_CLOSE = 2048;
@@ -1069,6 +1336,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	public void drawZoneAlpha(Projection entityProjection, Scene scene, int level, int zx, int zz)
 	{
+		endOpaqueGpuProfilerPhase();
+
 		SceneContext ctx = context(scene);
 		if (ctx == null)
 		{
@@ -1084,6 +1353,19 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		if (gpuProfiler.isEnabled())
+		{
+			if (!alphaGpuProfilerPhaseActive)
+			{
+				gpuProfiler.beginGpuPhase(GpuProfilerPhase.ALPHA_ZONES);
+				alphaGpuProfilerPhaseActive = true;
+			}
+			gpuProfiler.beginCpuPhase(GpuProfilerPhase.ALPHA_ZONES);
+			gpuProfiler.incrementCounter(GpuProfilerCounter.ALPHA_ZONE_DRAWS);
+			gpuProfiler.incrementCounter(GpuProfilerCounter.MULTI_DRAW_CALLS);
+		}
+		try
+		{
 		updateEntityProjection(entityProjection);
 		glUniform4i(uniEntityTint, scene.getOverrideHue(), scene.getOverrideSaturation(), scene.getOverrideLuminance(), scene.getOverrideAmount());
 
@@ -1101,6 +1383,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		z.renderAlpha(zx - offset, zz - offset, cameraYaw, cameraPitch, ctx.minLevel, ctx.level, ctx.maxLevel, level, ctx.hideRoofIds, !close || (scene.getOverrideAmount() > 0));
 
 		checkGLErrors();
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endCpuPhase(GpuProfilerPhase.ALPHA_ZONES);
+			}
+		}
 	}
 
 	@Override
@@ -1118,9 +1408,16 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		{
 			vaoO.addRange(projection, scene);
 			vaoPO.addRange(projection, scene);
+			endOpaqueGpuProfilerPhase();
 
 			if (scene.getWorldViewId() == WorldView.TOPLEVEL)
 			{
+				if (gpuProfiler.isEnabled())
+				{
+					gpuProfiler.beginPhase(GpuProfilerPhase.DYNAMIC_MODELS);
+				}
+				try
+				{
 				glUniform3i(uniBase, 0, 0, 0);
 
 				int sz = vaoO.unmap();
@@ -1128,6 +1425,10 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				{
 					VAO vao = vaoO.vaos.get(i);
 					vao.draw();
+					if (gpuProfiler.isEnabled())
+					{
+						gpuProfiler.incrementCounter(GpuProfilerCounter.DRAW_CALLS, vao.off);
+					}
 					vao.reset();
 				}
 
@@ -1139,6 +1440,10 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					{
 						VAO vao = vaoPO.vaos.get(i);
 						vao.draw();
+						if (gpuProfiler.isEnabled())
+						{
+							gpuProfiler.incrementCounter(GpuProfilerCounter.DRAW_CALLS, vao.off);
+						}
 					}
 					glDepthMask(true);
 
@@ -1147,14 +1452,27 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					{
 						VAO vao = vaoPO.vaos.get(i);
 						vao.draw();
+						if (gpuProfiler.isEnabled())
+						{
+							gpuProfiler.incrementCounter(GpuProfilerCounter.DRAW_CALLS, vao.off);
+						}
 						vao.reset();
 					}
 					glColorMask(true, true, true, true);
+				}
+				}
+				finally
+				{
+					if (gpuProfiler.isEnabled())
+					{
+						gpuProfiler.endPhase(GpuProfilerPhase.DYNAMIC_MODELS);
+					}
 				}
 			}
 		}
 		else if (pass == DrawCallbacks.PASS_ALPHA)
 		{
+			endAlphaGpuProfilerPhase();
 			for (int x = 0; x < ctx.sizeX; ++x)
 			{
 				for (int z = 0; z < ctx.sizeZ; ++z)
@@ -1182,7 +1500,18 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginCpuPhase(GpuProfilerPhase.DYNAMIC_MODELS);
+		}
+		try
+		{
 		int size = m.getFaceCount() * 3 * VAO.VERT_SIZE;
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.incrementCounter(GpuProfilerCounter.DYNAMIC_MODELS);
+			gpuProfiler.incrementCounter(GpuProfilerCounter.UPLOADED_BYTES, size);
+		}
 		if (m.getFaceTransparencies() == null)
 		{
 			VAO o = vaoO.get(size);
@@ -1217,6 +1546,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y, z & 1023);
 			}
 		}
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endCpuPhase(GpuProfilerPhase.DYNAMIC_MODELS);
+			}
+		}
 	}
 
 	@Override
@@ -1233,8 +1570,19 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginCpuPhase(GpuProfilerPhase.TEMP_MODELS);
+		}
+		try
+		{
 		Renderable renderable = gameObject.getRenderable();
 		int size = m.getFaceCount() * 3 * VAO.VERT_SIZE;
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.incrementCounter(GpuProfilerCounter.TEMP_MODELS);
+			gpuProfiler.incrementCounter(GpuProfilerCounter.UPLOADED_BYTES, size);
+		}
 		int renderMode = renderable.getRenderMode();
 		if (renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH || m.getFaceTransparencies() != null)
 		{
@@ -1270,6 +1618,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		{
 			VAO o = vaoO.get(size);
 			clientUploader.uploadTempModel(m, orient, x, y, z, o.vbo.vb);
+		}
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endCpuPhase(GpuProfilerPhase.TEMP_MODELS);
+			}
 		}
 	}
 
@@ -1315,6 +1671,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginCpuPhase(GpuProfilerPhase.ZONE_REBUILD);
+		}
+		try
+		{
 		for (int x = 0; x < ctx.sizeX; ++x)
 		{
 			for (int z = 0; z < ctx.sizeZ; ++z)
@@ -1349,21 +1711,42 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					a.map();
 				}
 
-				zone.init(o, a);
+				GpuProfiler profiler = gpuProfiler.isEnabled() ? gpuProfiler : null;
+				zone.init(o, a, profiler, profiler != null ? gpuProfilerZoneLabel(wv.getId(), x, z) : null);
 
 				clientUploader.uploadZone(scene, zone, x, z);
 
 				zone.unmap();
 				zone.initialized = true;
 				zone.dirty = true;
+				if (gpuProfiler.isEnabled())
+				{
+					gpuProfiler.incrementCounter(GpuProfilerCounter.ZONES_REBUILT);
+					gpuProfiler.incrementCounter(GpuProfilerCounter.UPLOADED_BYTES,
+						(long) (zone.sizeO + zone.sizeA) * Zone.VERT_SIZE * 3);
+				}
 
 				log.debug("Rebuilt zone wv={} x={} z={}", wv.getId(), x, z);
+			}
+		}
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endCpuPhase(GpuProfilerPhase.ZONE_REBUILD);
 			}
 		}
 	}
 
 	private void prepareInterfaceTexture(int canvasWidth, int canvasHeight)
 	{
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginPhase(GpuProfilerPhase.INTERFACE_TEXTURE);
+		}
+		try
+		{
 		if (canvasWidth != lastCanvasWidth || canvasHeight != lastCanvasHeight)
 		{
 			lastCanvasWidth = canvasWidth;
@@ -1396,6 +1779,18 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, 0);
 		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 		glBindTexture(GL_TEXTURE_2D, 0);
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.incrementCounter(GpuProfilerCounter.UPLOADED_BYTES, (long) width * height * Integer.BYTES);
+		}
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endPhase(GpuProfilerPhase.INTERFACE_TEXTURE);
+			}
+		}
 	}
 
 	@Override
@@ -1407,19 +1802,42 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		beginGpuProfilerFrame();
+
 		final TextureProvider textureProvider = client.getTextureProvider();
 		if (textureArrayId == -1 && textureProvider != null)
 		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.beginPhase(GpuProfilerPhase.TEXTURE_UPLOAD);
+			}
+			try
+			{
 			// lazy init textures as they may not be loaded at plugin start.
 			// this will return -1 and retry if not all textures are loaded yet, too.
 			textureArrayId = textureManager.initTextureArray(textureProvider);
 			if (textureArrayId > -1)
 			{
+				if (gpuProfiler.isEnabled())
+				{
+					gpuProfiler.incrementCounter(GpuProfilerCounter.TEXTURE_UPLOADS);
+					gpuProfiler.incrementCounter(GpuProfilerCounter.UPLOADED_BYTES,
+						(long) TextureManager.TEXTURE_COUNT * 128 * 128 * 4);
+					gpuProfiler.labelObject(GL_TEXTURE, textureArrayId, "scene texture array");
+				}
 				// if texture upload is successful, compute and set texture animations
 				float[] texAnims = textureManager.computeTextureAnimations(textureProvider);
 				glUseProgram(glProgram);
 				glUniform2fv(uniTextureAnimations, texAnims);
 				glUseProgram(0);
+			}
+			}
+			finally
+			{
+				if (gpuProfiler.isEnabled())
+				{
+					gpuProfiler.endPhase(GpuProfilerPhase.TEXTURE_UPLOAD);
+				}
 			}
 		}
 
@@ -1439,12 +1857,21 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		// Texture on UI
 		drawUi(overlayColor, canvasHeight, canvasWidth);
 
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginCpuPhase(GpuProfilerPhase.SWAP_BUFFERS);
+		}
 		try
 		{
 			awtContext.swapBuffers();
 		}
 		catch (RuntimeException ex)
 		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endCpuPhase(GpuProfilerPhase.SWAP_BUFFERS);
+			}
+			endGpuProfilerFrame();
 			// this is always fatal
 			if (!canvas.isValid())
 			{
@@ -1468,16 +1895,41 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			});
 			return;
 		}
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.endCpuPhase(GpuProfilerPhase.SWAP_BUFFERS);
+		}
 
-		drawManager.processDrawComplete(this::screenshot);
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginCpuPhase(GpuProfilerPhase.DRAW_COMPLETE);
+		}
+		try
+		{
+			drawManager.processDrawComplete(this::screenshot);
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endCpuPhase(GpuProfilerPhase.DRAW_COMPLETE);
+			}
+		}
 
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
 
 		checkGLErrors();
+		endGpuProfilerFrame();
 	}
 
 	private void drawUi(final int overlayColor, final int canvasHeight, final int canvasWidth)
 	{
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.beginPhase(GpuProfilerPhase.UI_DRAW);
+		}
+		try
+		{
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 		glBindTexture(GL_TEXTURE_2D, interfaceTexture);
@@ -1527,6 +1979,18 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		glUseProgram(0);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		glDisable(GL_BLEND);
+		if (gpuProfiler.isEnabled())
+		{
+			gpuProfiler.incrementCounter(GpuProfilerCounter.DRAW_CALLS);
+		}
+		}
+		finally
+		{
+			if (gpuProfiler.isEnabled())
+			{
+				gpuProfiler.endPhase(GpuProfilerPhase.UI_DRAW);
+			}
+		}
 	}
 
 	/**
@@ -1837,7 +2301,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 						a.map();
 					}
 
-					zone.init(o, a);
+					GpuProfiler profiler = gpuProfiler.isEnabled() ? gpuProfiler : null;
+					zone.init(o, a, profiler, profiler != null ? gpuProfilerZoneLabel(scene.getWorldViewId(), x, z) : null);
 				}
 			}
 
@@ -1955,7 +2420,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 						a.map();
 					}
 
-					zone.init(o, a);
+					GpuProfiler profiler = gpuProfiler.isEnabled() ? gpuProfiler : null;
+					zone.init(o, a, profiler, profiler != null ? gpuProfilerZoneLabel(worldViewId, x, z) : null);
 				}
 			}
 

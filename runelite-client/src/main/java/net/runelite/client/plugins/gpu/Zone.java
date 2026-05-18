@@ -39,12 +39,14 @@ import net.runelite.api.Model;
 import net.runelite.api.Perspective;
 import net.runelite.api.Scene;
 import net.runelite.api.WorldView;
+import net.runelite.client.plugins.gpu.profiling.GpuProfiler;
 import static net.runelite.client.plugins.gpu.FacePrioritySorter.MAX_DIAMETER;
 import static net.runelite.client.plugins.gpu.FacePrioritySorter.zsortHead;
 import static net.runelite.client.plugins.gpu.FacePrioritySorter.zsortNext;
 import static net.runelite.client.plugins.gpu.FacePrioritySorter.zsortTail;
 import static net.runelite.client.plugins.gpu.GpuPlugin.uniBase;
 import org.lwjgl.BufferUtils;
+import static org.lwjgl.opengl.GL43C.GL_BUFFER;
 import static org.lwjgl.opengl.GL33C.*;
 
 @Slf4j
@@ -81,6 +83,11 @@ class Zone
 
 	void init(VBO o, VBO a)
 	{
+		init(o, a, null, null);
+	}
+
+	void init(VBO o, VBO a, GpuProfiler profiler, String label)
+	{
 		assert glVao == 0;
 		assert glVaoA == 0;
 
@@ -89,6 +96,11 @@ class Zone
 			vboO = o;
 			glVao = glGenVertexArrays();
 			setupVao(glVao, o.bufId);
+			if (profiler != null)
+			{
+				profiler.labelObject(GL_VERTEX_ARRAY, glVao, label + " opaque vertex array");
+				profiler.labelObject(GL_BUFFER, o.bufId, label + " opaque vertex buffer");
+			}
 		}
 
 		if (a != null)
@@ -96,6 +108,11 @@ class Zone
 			vboA = a;
 			glVaoA = glGenVertexArrays();
 			setupVao(glVaoA, a.bufId);
+			if (profiler != null)
+			{
+				profiler.labelObject(GL_VERTEX_ARRAY, glVaoA, label + " alpha vertex array");
+				profiler.labelObject(GL_BUFFER, a.bufId, label + " alpha vertex buffer");
+			}
 		}
 	}
 

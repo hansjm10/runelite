@@ -30,8 +30,10 @@ import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Projection;
 import net.runelite.api.Scene;
+import net.runelite.client.plugins.gpu.profiling.GpuProfiler;
 import static net.runelite.client.plugins.gpu.GpuPlugin.uniEntityTint;
 import static net.runelite.client.plugins.gpu.GpuPlugin.updateEntityProjection;
+import static org.lwjgl.opengl.GL43C.GL_BUFFER;
 import static org.lwjgl.opengl.GL33C.*;
 
 class VAO
@@ -50,7 +52,7 @@ class VAO
 		vbo = new VBO(size);
 	}
 
-	void init()
+	void init(GpuProfiler profiler, String name)
 	{
 		vao = glGenVertexArrays();
 		glBindVertexArray(vao);
@@ -69,6 +71,11 @@ class VAO
 
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glBindVertexArray(0);
+		if (profiler != null)
+		{
+			profiler.labelObject(GL_VERTEX_ARRAY, vao, name + " vertex array");
+			profiler.labelObject(GL_BUFFER, vbo.bufId, name + " vertex buffer");
+		}
 	}
 
 	void destroy()
@@ -144,6 +151,14 @@ class VAOList
 
 	private int curIdx;
 	final List<VAO> vaos = new ArrayList<>();
+	private final String name;
+	private final GpuProfiler profiler;
+
+	VAOList(String name, GpuProfiler profiler)
+	{
+		this.name = name;
+		this.profiler = profiler;
+	}
 
 	VAO get(int size)
 	{
@@ -167,7 +182,8 @@ class VAOList
 		}
 
 		VAO vao = new VAO(VAO_SIZE);
-		vao.init();
+		GpuProfiler activeProfiler = profiler != null && profiler.isEnabled() ? profiler : null;
+		vao.init(activeProfiler, activeProfiler != null ? name + " " + vaos.size() : null);
 		vao.vbo.map();
 		vaos.add(vao);
 		log.debug("Allocated VAO {} request {}", vao.vao, size);

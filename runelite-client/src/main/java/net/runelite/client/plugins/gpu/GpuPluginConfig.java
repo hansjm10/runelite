@@ -231,4 +231,37 @@ public interface GpuPluginConfig extends Config
 	{
 		return true;
 	}
+
+	@ConfigItem(
+		keyName = "gpuProfiler",
+		name = "GPU profiler",
+		description = "Enables developer CPU/GPU render profiling. This allocates OpenGL timer queries while enabled.",
+		position = 15
+	)
+	default boolean gpuProfiler()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "gpuProfilerOverlay",
+		name = "Profiler overlay",
+		description = "Shows the GPU profiler overlay while profiling is enabled.",
+		position = 16
+	)
+	default boolean gpuProfilerOverlay()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "gpuProfilerDebugMarkers",
+		name = "Profiler debug markers",
+		description = "Adds OpenGL debug groups and object labels for graphics capture tools while profiling is enabled.",
+		position = 17
+	)
+	default boolean gpuProfilerDebugMarkers()
+	{
+		return true;
+	}
 }
