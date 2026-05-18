@@ -107,6 +107,8 @@ class FacePrioritySorter
 
 		final byte[] transparencies = model.getFaceTransparencies();
 		final byte[] bias = model.getFaceBias();
+		// No-depth priority sorted models require the original mixed face order.
+		final boolean splitOpaque = !prioritySort && transparencies != null;
 
 		float orientSine = 0;
 		float orientCosine = 0;
@@ -181,24 +183,27 @@ class FacePrioritySorter
 
 				if ((aX - bX) * (cY - bY) - (cX - bX) * (aY - bY) > 0)
 				{
-					int distance = radius + (distances[v1] + distances[v2] + distances[v3]) / 3;
-					assert distance >= 0 && distance < diameter;
-
-					if (zsortTail[distance] == (char) -1)
+					if (!splitOpaque || transparencies[faceIdx] != 0)
 					{
-						zsortHead[distance] = zsortTail[distance] = faceIdx;
-						zsortNext[faceIdx] = (char) -1;
-					}
-					else
-					{
-						char lastFace = zsortTail[distance];
-						zsortNext[lastFace] = faceIdx;
-						zsortNext[faceIdx] = (char) -1;
-						zsortTail[distance] = faceIdx;
-					}
+						int distance = radius + (distances[v1] + distances[v2] + distances[v3]) / 3;
+						assert distance >= 0 && distance < diameter;
 
-					minFz = Math.min(minFz, distance);
-					maxFz = Math.max(maxFz, distance);
+						if (zsortTail[distance] == (char) -1)
+						{
+							zsortHead[distance] = zsortTail[distance] = faceIdx;
+							zsortNext[faceIdx] = (char) -1;
+						}
+						else
+						{
+							char lastFace = zsortTail[distance];
+							zsortNext[lastFace] = faceIdx;
+							zsortNext[faceIdx] = (char) -1;
+							zsortTail[distance] = faceIdx;
+						}
+
+						minFz = Math.min(minFz, distance);
+						maxFz = Math.max(maxFz, distance);
+					}
 
 					sceneUploader.computeFaceUvs(model, faceIdx);
 
@@ -257,6 +262,11 @@ class FacePrioritySorter
 					vertexBuffer[vbOff++] = alphaBias | color3;
 					vertexBuffer[vbOff++] = ((su2 & 0xffff) << 16 | (texture & 0xffff));
 					vertexBuffer[vbOff++] = sv2 & 0xffff;
+
+					if (splitOpaque && transparencies[faceIdx] == 0)
+					{
+						opaqueBuffer.put(vertexBuffer, faceIdx * FACE_SIZE, FACE_SIZE);
+					}
 				}
 			}
 		}
