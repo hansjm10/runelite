@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "mode": "snapshot",
+  "generatedAt": "2026-11-02T21:00:00Z",
+  "asOf": "2026-11-02T20:59:00Z",
+  "expiresAt": "2026-11-02T21:05:00Z",
+  "bankrollGp": 10000000,
+  "cashReserveGp": 2000000,
+  "availableSlots": 6,
+  "sessionMinutes": 30,
+  "policy": "chronos_guard",
+  "accountLimitsVerified": false,
+  "warnings": [
+    "Unvalidated execution assumptions; quotes are not guaranteed fills or expected profit.",
+    "Verify actual cash, free slots, tax exemptions and remaining personal/shared buy limits yourself.",
+    "This is an initial allocation only, not automatic live replanning or order management."
+  ],
+  "candidates": [
+    {
+      "itemId": 1,
+      "name": "Synthetic contract item",
+      "buyPrice": 100000,
+      "sellPrice": 103000,
+      "quantity": 10,
+      "capitalGp": 1000000,
+      "taxPerItemGp": 2060,
+      "netMarginPerItemGp": 940
+    }
+  ]
+}
